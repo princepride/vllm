@@ -220,6 +220,7 @@ _MULTIMODAL_MODELS = {
     "Llama4ForConditionalGeneration": ("mllama4", "Llama4ForConditionalGeneration"),  # noqa: E501
     "SkyworkR1VChatModel": ("skyworkr1v", "SkyworkR1VChatModel"),
     "WhisperForConditionalGeneration": ("whisper", "WhisperForConditionalGeneration"),  # noqa: E501
+    "DonutModel": ("donut", "DonutModel")
 }
 
 _SPECULATIVE_DECODING_MODELS = {
