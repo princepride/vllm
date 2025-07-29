@@ -2,8 +2,9 @@
 # SPDX-FileCopyrightText: Copyright 2024 ByteDance Ltd. and/or its affiliates.
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project.
 
-from collections.abc import Iterable
-from typing import Any, Dict, Optional, Union
+from abc import abstractmethod
+from collections.abc import Iterable, Mapping, Sequence
+from typing import Any, Dict, Optional, Union, TypeVar
 import numpy as np
 import math
 from dataclasses import dataclass
@@ -12,15 +13,23 @@ from einops import rearrange
 import torch
 import torch.nn as nn
 from torch import Tensor
-from transformers import PretrainedConfig
+from transformers import (BatchFeature, PretrainedConfig)
 from transformers.activations import ACT2FN
 
 from vllm.config import VllmConfig
-from vllm.model_executor.layers.quantization import QuantizationConfig
+from vllm.inputs import InputProcessingContext
 from vllm.model_executor.sampling_metadata import SamplingMetadata
 from vllm.multimodal import MULTIMODAL_REGISTRY
 from vllm.sequence import IntermediateTensors
-
+from vllm.multimodal.inputs import (MultiModalDataDict, MultiModalFieldConfig,
+                                    MultiModalInputs, MultiModalKwargs)
+from vllm.multimodal.parse import (ImageEmbeddingItems, ImageProcessorItems,
+                                   ImageSize, MultiModalDataItems)
+from vllm.multimodal.processing import (BaseMultiModalProcessor,
+                                        BaseProcessingInfo, ProcessingCache,
+                                        PromptReplacement, PromptUpdate,
+                                        PromptUpdateDetails)
+from vllm.multimodal.profiling import BaseDummyInputsBuilder
 # Import vLLM's native models for the backbones
 from .qwen2 import Qwen2ForCausalLM
 from .siglip import SiglipVisionModel
@@ -29,6 +38,7 @@ from .siglip import SiglipVisionModel
 from .interfaces import MultiModalEmbeddings, SupportsMultiModal, SupportsPP
 from .utils import (AutoWeightsLoader, WeightsMapper,
                     merge_multimodal_embeddings)
+from .vision import get_vision_encoder_info
 
 @dataclass
 class AutoEncoderParams:
@@ -42,6 +52,9 @@ class AutoEncoderParams:
     z_channels: int
     scale_factor: float
     shift_factor: float
+
+class BagelProcessor:
+    pass
 
 def get_2d_sincos_pos_embed(embed_dim, grid_size, cls_token=False, extra_tokens=0):
     grid_h = np.arange(grid_size, dtype=np.float32)
@@ -474,7 +487,191 @@ class PositionEmbedding(nn.Module):
     def forward(self, position_ids):
         return self.pos_embed[position_ids]
 
-@MULTIMODAL_REGISTRY.register_processor("bagel")
+
+class BaseBagelProcessingInfo(BaseProcessingInfo):
+
+    def get_hf_config(self):
+        return self.ctx.get_hf_config(BagelConfig)
+
+    def get_vision_encoder_info(self):
+        return get_vision_encoder_info(self.get_hf_config())
+
+    @abstractmethod
+    def get_hf_processor(self, **kwargs: object):
+        raise NotImplementedError
+
+    def get_supported_mm_limits(self) -> Mapping[str, Optional[int]]:
+        return {"image": None}
+
+    def _apply_feature_select_strategy(
+        self,
+        strategy: str,
+        encoder_num_image_tokens: int,
+    ) -> int:
+        if strategy == "default":
+            return encoder_num_image_tokens - 1
+        if strategy == "full":
+            return encoder_num_image_tokens
+
+        msg = f"Unexpected feature select strategy: {strategy!r}"
+        raise NotImplementedError(msg)
+
+    def get_num_image_tokens(
+        self,
+        *,
+        image_width: int,
+        image_height: int,
+    ) -> int:
+        hf_config = self.get_hf_config()
+        vision_encoder_info = self.get_vision_encoder_info()
+
+        return self._apply_feature_select_strategy(
+            hf_config.vision_feature_select_strategy,
+            vision_encoder_info.get_num_image_tokens(
+                image_width=image_width,
+                image_height=image_height,
+            ),
+        )
+
+    def get_image_size_with_most_features(self) -> ImageSize:
+        vision_encoder_info = self.get_vision_encoder_info()
+        width = height = vision_encoder_info.get_image_size()
+        return ImageSize(width=width, height=height)
+
+    def get_max_image_tokens(self) -> int:
+        target_width, target_height = self.get_image_size_with_most_features()
+
+        return self.get_num_image_tokens(
+            image_width=target_width,
+            image_height=target_height,
+        )
+
+
+_I = TypeVar("_I", bound=BaseBagelProcessingInfo)
+
+
+class BagelDummyInputsBuilder(BaseDummyInputsBuilder[_I]):
+
+    def get_dummy_text(self, mm_counts: Mapping[str, int]) -> str:
+        num_images = mm_counts.get("image", 0)
+
+        processor = self.info.get_hf_processor()
+        image_token = processor.image_token
+
+        return image_token * num_images
+
+    def get_dummy_mm_data(
+        self,
+        seq_len: int,
+        mm_counts: Mapping[str, int],
+    ) -> MultiModalDataDict:
+        num_images = mm_counts.get("image", 0)
+
+        target_width, target_height = \
+            self.info.get_image_size_with_most_features()
+
+        return {
+            "image":
+            self._get_dummy_images(width=target_width,
+                                   height=target_height,
+                                   num_images=num_images)
+        }
+
+
+class BagelProcessingInfo(BaseBagelProcessingInfo):
+
+    def get_hf_processor(self, **kwargs: object):
+        hf_processor = self.ctx.get_hf_processor(BagelProcessor, **kwargs)
+        # In case patch_size is omitted from `processor_config.json`
+        # e.g. for E5-V: https://huggingface.co/royokong/e5-v
+        if hf_processor.patch_size is None:
+            patch_size = self.get_vision_encoder_info().get_patch_size()
+            hf_processor.patch_size = patch_size
+        return hf_processor
+
+
+class BaseBagelMultiModalProcessor(BaseMultiModalProcessor[_I]):
+
+    # Copied from BaseMultiModalProcessor
+    @abstractmethod
+    def _get_mm_fields_config(
+        self,
+        hf_inputs: BatchFeature,
+        hf_processor_mm_kwargs: Mapping[str, object],
+    ) -> Mapping[str, MultiModalFieldConfig]:
+        raise NotImplementedError
+
+    def _get_prompt_updates(
+        self,
+        mm_items: MultiModalDataItems,
+        hf_processor_mm_kwargs: Mapping[str, object],
+        out_mm_kwargs: MultiModalKwargs,
+    ) -> Sequence[PromptUpdate]:
+        hf_config = self.info.get_hf_config()
+        image_token_id = hf_config.image_token_index
+
+        def get_replacement(item_idx: int):
+            images = mm_items.get_items(
+                "image", (ImageEmbeddingItems, ImageProcessorItems))
+
+            if isinstance(images, ImageEmbeddingItems):
+                num_image_tokens = images.get_feature_size(item_idx)
+            else:
+                image_size = images.get_image_size(item_idx)
+                num_image_tokens = self.info.get_num_image_tokens(
+                    image_width=image_size.width,
+                    image_height=image_size.height,
+                )
+
+            return [image_token_id] * num_image_tokens
+
+        return [
+            PromptReplacement(
+                modality="image",
+                target=[image_token_id],
+                replacement=get_replacement,
+            ),
+        ]
+
+
+class BagelMultiModalProcessor(
+        BaseBagelMultiModalProcessor[BagelProcessingInfo]):
+
+    def _get_mm_fields_config(
+        self,
+        hf_inputs: BatchFeature,
+        hf_processor_mm_kwargs: Mapping[str, object],
+    ) -> Mapping[str, MultiModalFieldConfig]:
+        return dict(
+            pixel_values=MultiModalFieldConfig.batched("image"),
+            image_embeds=MultiModalFieldConfig.batched("image"),
+        )
+
+def _build_bagel_hf_info(
+    ctx: InputProcessingContext, ) -> BaseBagelProcessingInfo:
+    hf_config = ctx.get_hf_config(BagelConfig)
+
+    return BagelProcessingInfo(ctx)
+
+
+def _build_bagel_hf_processor(
+    info: _I,
+    dummy_inputs: BaseDummyInputsBuilder[_I],
+    *,
+    cache: Optional[ProcessingCache] = None,
+) -> BaseMultiModalProcessor:
+    if isinstance(info, BagelProcessingInfo):
+        return BagelMultiModalProcessor(
+            info,
+            dummy_inputs,  # type: ignore
+            cache=cache,
+        )
+
+    raise NotImplementedError(type(info))
+
+@MULTIMODAL_REGISTRY.register_processor(_build_bagel_hf_processor,
+                                        info=_build_bagel_hf_info,
+                                        dummy_inputs=BagelDummyInputsBuilder)
 class BagelForConditionalGeneration(nn.Module, SupportsMultiModal, SupportsPP):
     """
     vLLM implementation of the Bagel model.
