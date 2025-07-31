@@ -2,9 +2,8 @@
 # SPDX-FileCopyrightText: Copyright 2024 ByteDance Ltd. and/or its affiliates.
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project.
 
-from abc import abstractmethod
 from collections.abc import Iterable, Mapping, Sequence
-from typing import Any, Dict, Optional, Union, TypeVar
+from typing import Any, Dict, Optional, Union
 import numpy as np
 import math
 from dataclasses import dataclass
@@ -13,7 +12,7 @@ from einops import rearrange
 import torch
 import torch.nn as nn
 from torch import Tensor
-from transformers import (BatchFeature, PretrainedConfig)
+from transformers import BatchFeature, PretrainedConfig, SiglipProcessor
 from transformers.activations import ACT2FN
 
 from vllm.config import VllmConfig
@@ -30,7 +29,6 @@ from vllm.multimodal.processing import (BaseMultiModalProcessor,
                                         PromptReplacement, PromptUpdate,
                                         PromptUpdateDetails)
 from vllm.multimodal.profiling import BaseDummyInputsBuilder
-from vllm.transformers_utils.configs import BagelConfig
 # Import vLLM's native models for the backbones
 from .qwen2 import Qwen2ForCausalLM
 from .siglip import SiglipVisionModel
@@ -54,7 +52,7 @@ class AutoEncoderParams:
     scale_factor: float
     shift_factor: float
 
-class BagelProcessor:
+class BagelProcessor(SiglipProcessor):
     pass
 
 def get_2d_sincos_pos_embed(embed_dim, grid_size, cls_token=False, extra_tokens=0):
@@ -426,6 +424,35 @@ class AutoEncoder(nn.Module):
 
     def forward(self, x: Tensor) -> Tensor:
         return self.decode(self.encode(x))
+    
+class BagelConfig(PretrainedConfig):
+    def __init__(
+        self,
+        visual_gen=True,
+        visual_und=True,
+        llm_config=None,
+        vit_config=None,
+        vae_config=None,
+        latent_patch_size=2,
+        max_latent_size=32,
+        vit_max_num_patch_per_side=70,
+        connector_act="gelu_pytorch_tanh",
+        interpolate_pos=False,
+        timestep_shift=1.0,
+        **kwargs
+    ):
+        super().__init__(**kwargs)
+        self.visual_gen = visual_gen
+        self.visual_und = visual_und
+        self.llm_config = llm_config
+        self.vit_config = vit_config
+        self.vae_config = vae_config
+        self.latent_patch_size = latent_patch_size
+        self.max_latent_size = max_latent_size
+        self.vit_max_num_patch_per_side = vit_max_num_patch_per_side
+        self.connector_act = connector_act
+        self.interpolate_pos = interpolate_pos
+        self.timestep_shift = timestep_shift
 
 class MLPconnector(nn.Module):
     def __init__(self, in_dim: int, out_dim: int, hidden_act: str):
@@ -459,18 +486,23 @@ class PositionEmbedding(nn.Module):
     def forward(self, position_ids):
         return self.pos_embed[position_ids]
 
-
-class BaseBagelProcessingInfo(BaseProcessingInfo):
-
+class BagelProcessingInfo(BaseProcessingInfo):
+    """
+    简化后的处理信息类，合并了基类和实现类的所有逻辑。
+    """
     def get_hf_config(self):
         return self.ctx.get_hf_config(BagelConfig)
 
     def get_vision_encoder_info(self):
         return get_vision_encoder_info(self.get_hf_config())
 
-    @abstractmethod
     def get_hf_processor(self, **kwargs: object):
-        raise NotImplementedError
+        # 这是原 BagelProcessingInfo 的具体实现，现在是唯一实现
+        hf_processor = self.ctx.get_hf_processor(BagelProcessor, **kwargs)
+        # if hf_processor.patch_size is None:
+        #     patch_size = self.get_vision_encoder_info().get_patch_size()
+        #     hf_processor.patch_size = patch_size
+        return hf_processor
 
     def get_supported_mm_limits(self) -> Mapping[str, Optional[int]]:
         return {"image": None}
@@ -484,16 +516,12 @@ class BaseBagelProcessingInfo(BaseProcessingInfo):
             return encoder_num_image_tokens - 1
         if strategy == "full":
             return encoder_num_image_tokens
-
+        
+        # 保留此错误以防配置错误
         msg = f"Unexpected feature select strategy: {strategy!r}"
-        raise NotImplementedError(msg)
+        raise ValueError(msg)
 
-    def get_num_image_tokens(
-        self,
-        *,
-        image_width: int,
-        image_height: int,
-    ) -> int:
+    def get_num_image_tokens(self, *, image_width: int, image_height: int) -> int:
         hf_config = self.get_hf_config()
         vision_encoder_info = self.get_vision_encoder_info()
 
@@ -512,66 +540,41 @@ class BaseBagelProcessingInfo(BaseProcessingInfo):
 
     def get_max_image_tokens(self) -> int:
         target_width, target_height = self.get_image_size_with_most_features()
-
         return self.get_num_image_tokens(
-            image_width=target_width,
-            image_height=target_height,
+            image_width=target_width, height=target_height
         )
 
-
-_I = TypeVar("_I", bound=BaseBagelProcessingInfo)
-
-
-class BagelDummyInputsBuilder(BaseDummyInputsBuilder[_I]):
+class BagelDummyInputsBuilder(BaseDummyInputsBuilder[BagelProcessingInfo]):
 
     def get_dummy_text(self, mm_counts: Mapping[str, int]) -> str:
         num_images = mm_counts.get("image", 0)
-
         processor = self.info.get_hf_processor()
         image_token = processor.image_token
-
         return image_token * num_images
 
-    def get_dummy_mm_data(
-        self,
-        seq_len: int,
-        mm_counts: Mapping[str, int],
-    ) -> MultiModalDataDict:
+    def get_dummy_mm_data(self, seq_len: int, mm_counts: Mapping[str, int]) -> MultiModalDataDict:
         num_images = mm_counts.get("image", 0)
-
-        target_width, target_height = \
-            self.info.get_image_size_with_most_features()
-
+        target_width, target_height = self.info.get_image_size_with_most_features()
         return {
-            "image":
-            self._get_dummy_images(width=target_width,
-                                   height=target_height,
-                                   num_images=num_images)
+            "image": self._get_dummy_images(
+                width=target_width, height=target_height, num_images=num_images
+            )
         }
 
-
-class BagelProcessingInfo(BaseBagelProcessingInfo):
-
-    def get_hf_processor(self, **kwargs: object):
-        hf_processor = self.ctx.get_hf_processor(BagelProcessor, **kwargs)
-        # In case patch_size is omitted from `processor_config.json`
-        # e.g. for E5-V: https://huggingface.co/royokong/e5-v
-        if hf_processor.patch_size is None:
-            patch_size = self.get_vision_encoder_info().get_patch_size()
-            hf_processor.patch_size = patch_size
-        return hf_processor
-
-
-class BaseBagelMultiModalProcessor(BaseMultiModalProcessor[_I]):
-
-    # Copied from BaseMultiModalProcessor
-    @abstractmethod
+class BagelMultiModalProcessor(BaseMultiModalProcessor[BagelProcessingInfo]):
+    """
+    简化后的多模态处理器，合并了基类和实现类的所有逻辑。
+    """
     def _get_mm_fields_config(
         self,
         hf_inputs: BatchFeature,
         hf_processor_mm_kwargs: Mapping[str, object],
     ) -> Mapping[str, MultiModalFieldConfig]:
-        raise NotImplementedError
+        # 这是原 BagelMultiModalProcessor 的具体实现
+        return dict(
+            pixel_values=MultiModalFieldConfig.batched("image"),
+            image_embeds=MultiModalFieldConfig.batched("image"),
+        )
 
     def _get_prompt_updates(
         self,
@@ -579,13 +582,12 @@ class BaseBagelMultiModalProcessor(BaseMultiModalProcessor[_I]):
         hf_processor_mm_kwargs: Mapping[str, object],
         out_mm_kwargs: MultiModalKwargs,
     ) -> Sequence[PromptUpdate]:
+        # 这部分逻辑从原 BaseBagelMultiModalProcessor 移入
         hf_config = self.info.get_hf_config()
         image_token_id = hf_config.image_token_index
 
         def get_replacement(item_idx: int):
-            images = mm_items.get_items(
-                "image", (ImageEmbeddingItems, ImageProcessorItems))
-
+            images = mm_items.get_items("image", (ImageEmbeddingItems, ImageProcessorItems))
             if isinstance(images, ImageEmbeddingItems):
                 num_image_tokens = images.get_feature_size(item_idx)
             else:
@@ -594,7 +596,6 @@ class BaseBagelMultiModalProcessor(BaseMultiModalProcessor[_I]):
                     image_width=image_size.width,
                     image_height=image_size.height,
                 )
-
             return [image_token_id] * num_image_tokens
 
         return [
@@ -605,41 +606,20 @@ class BaseBagelMultiModalProcessor(BaseMultiModalProcessor[_I]):
             ),
         ]
 
-
-class BagelMultiModalProcessor(
-        BaseBagelMultiModalProcessor[BagelProcessingInfo]):
-
-    def _get_mm_fields_config(
-        self,
-        hf_inputs: BatchFeature,
-        hf_processor_mm_kwargs: Mapping[str, object],
-    ) -> Mapping[str, MultiModalFieldConfig]:
-        return dict(
-            pixel_values=MultiModalFieldConfig.batched("image"),
-            image_embeds=MultiModalFieldConfig.batched("image"),
-        )
-
-def _build_bagel_hf_info(
-    ctx: InputProcessingContext, ) -> BaseBagelProcessingInfo:
-    hf_config = ctx.get_hf_config(BagelConfig)
-
+def _build_bagel_hf_info(ctx: InputProcessingContext) -> BagelProcessingInfo:
+    """直接返回唯一的处理信息类实例。"""
     return BagelProcessingInfo(ctx)
 
 
 def _build_bagel_hf_processor(
-    info: _I,
-    dummy_inputs: BaseDummyInputsBuilder[_I],
+    info: BagelProcessingInfo,
+    dummy_inputs: BagelDummyInputsBuilder,
     *,
     cache: Optional[ProcessingCache] = None,
-) -> BaseMultiModalProcessor:
-    if isinstance(info, BagelProcessingInfo):
-        return BagelMultiModalProcessor(
-            info,
-            dummy_inputs,  # type: ignore
-            cache=cache,
-        )
+) -> BagelMultiModalProcessor:
+    """移除不必要的类型检查，直接返回唯一的处理器实例。"""
+    return BagelMultiModalProcessor(info, dummy_inputs, cache=cache)
 
-    raise NotImplementedError(type(info))
 
 @MULTIMODAL_REGISTRY.register_processor(_build_bagel_hf_processor,
                                         info=_build_bagel_hf_info,
@@ -647,14 +627,7 @@ def _build_bagel_hf_processor(
 class BagelForConditionalGeneration(nn.Module, SupportsMultiModal, SupportsPP):
     """
     vLLM implementation of the Bagel model.
-
-    This class integrates Bagel's multi-modal architecture with vLLM's
-    inference engine, handling the Mixture-of-Talents LLM, the ViT and VAE
-    pathways, and the specific weight loading requirements.
     """
-
-    # Maps Hugging Face checkpoint keys to the vLLM module names.
-    # This is crucial for loading weights from the `ema.safetensors` file.
     hf_to_vllm_mapper = WeightsMapper(
         orig_to_new_prefix={
             "language_model.": "language_model.",
@@ -673,105 +646,48 @@ class BagelForConditionalGeneration(nn.Module, SupportsMultiModal, SupportsPP):
         self.config: BagelConfig = vllm_config.model_config.hf_config
         quant_config = vllm_config.quant_config
 
-        # 1. Initialize Language Model Backbone (Qwen2 with MoT)
-        # NOTE: This assumes the vLLM Qwen2 implementation is adapted to handle
-        # the 'mode' parameter and the Mixture-of-Talents weights.
-        self.language_model = Qwen2ForCausalLM(
-            config=self.config.llm_config,
-            quant_config=quant_config,
-        )
-
-        # 2. Initialize Vision Understanding Backbone (SigLIP ViT)
+        self.language_model = Qwen2ForCausalLM(config=self.config.llm_config, quant_config=quant_config)
         self.vit_model = SiglipVisionModel(config=self.config.vit_config)
-
-        # 3. Initialize Bagel's Connector and Embedding Layers
-        self.connector = MLPconnector(self.config.vit_hidden_size,
-                                      self.config.hidden_size,
-                                      self.config.connector_act)
-        self.vit_pos_embed = PositionEmbedding(
-            self.config.vit_max_num_patch_per_side, self.config.hidden_size)
+        self.connector = MLPconnector(self.config.vit_hidden_size, self.config.hidden_size, self.config.connector_act)
+        self.vit_pos_embed = PositionEmbedding(self.config.vit_max_num_patch_per_side, self.config.hidden_size)
         self.time_embedder = TimestepEmbedder(self.config.hidden_size)
-        self.vae2llm = nn.Linear(
-            self.config.patch_latent_dim, self.config.hidden_size)
-        self.llm2vae = nn.Linear(
-            self.config.hidden_size, self.config.patch_latent_dim)
-        self.latent_pos_embed = PositionEmbedding(self.config.max_latent_size,
-                                                  self.config.hidden_size)
+        self.vae2llm = nn.Linear(self.config.patch_latent_dim, self.config.hidden_size)
+        self.llm2vae = nn.Linear(self.config.hidden_size, self.config.patch_latent_dim)
+        self.latent_pos_embed = PositionEmbedding(self.config.max_latent_size, self.config.hidden_size)
 
-        # 4. Initialize the AutoEncoder (VAE)
-        # This module's weights are loaded from a separate file (`ae.safetensors`).
         vae_params = AutoEncoderParams(**self.config.vae_config)
         self.vae_model = AutoEncoder(vae_params)
 
     def get_language_model(self) -> nn.Module:
         return self.language_model
 
-    def _process_image_understanding_input(
-            self, pixel_values: Tensor,
-            vit_position_ids: Tensor) -> Tensor:
-        """
-        Processes images through the ViT pathway for understanding tasks.
-        (Image2Text, Image2Image-Conditioning)
-        """
-        # Get image features from the Vision Transformer
+    def _process_image_understanding_input(self, pixel_values: Tensor, vit_position_ids: Tensor) -> Tensor:
         image_features = self.vit_model(pixel_values)
-        # Project features into the LLM's embedding space
         image_embeds = self.connector(image_features)
-        # Add positional embeddings
         image_embeds = image_embeds + self.vit_pos_embed(vit_position_ids)
         return image_embeds
 
-    def _process_image_generation_input(self, latents: Tensor,
-                                        timesteps: Tensor,
-                                        latent_position_ids: Tensor) -> Tensor:
-        """
-        Processes latent representations through the VAE pathway for a
-        single generation step. (Text2Image, Image2Image-Generation)
-        """
-        # Project latents into the LLM's embedding space
+    def _process_image_generation_input(self, latents: Tensor, timesteps: Tensor, latent_position_ids: Tensor) -> Tensor:
         latent_embeds = self.vae2llm(latents)
-        # Add time and positional embeddings
         time_embeds = self.time_embedder(timesteps)
         pos_embeds = self.latent_pos_embed(latent_position_ids)
         return latent_embeds + time_embeds + pos_embeds
 
-    def get_multimodal_embeddings(self,
-                                  **kwargs: object) -> MultiModalEmbeddings:
-        """
-        vLLM entry point to compute embeddings for different modalities
-        based on the provided keyword arguments.
-        """
+    def get_multimodal_embeddings(self, **kwargs: object) -> MultiModalEmbeddings:
         if "pixel_values" in kwargs:
             return self._process_image_understanding_input(
                 kwargs["pixel_values"], kwargs["vit_position_ids"])
-
         if "latents" in kwargs:
             return self._process_image_generation_input(
-                kwargs["latents"], kwargs["timesteps"],
-                kwargs["latent_position_ids"])
-
+                kwargs["latents"], kwargs["timesteps"], kwargs["latent_position_ids"])
         return []
 
-    def get_input_embeddings(
-        self,
-        input_ids: Tensor,
-        multimodal_embeddings: Optional[MultiModalEmbeddings] = None,
-    ) -> Tensor:
-        """
-        Merges text token embeddings with computed multimodal embeddings.
-        """
+    def get_input_embeddings(self, input_ids: Tensor, multimodal_embeddings: Optional[MultiModalEmbeddings] = None) -> Tensor:
         inputs_embeds = self.language_model.model.embed_tokens(input_ids)
-
-        if multimodal_embeddings is not None and multimodal_embeddings.numel(
-        ) > 0:
-            # Bagel uses a dictionary of special token IDs. We assume this is
-            # available in the config for placeholder replacement.
-            # Here, we use a generic 'start_of_image' placeholder ID.
+        if multimodal_embeddings is not None and multimodal_embeddings.numel() > 0:
             image_token_id = self.config.new_token_ids['start_of_image']
             inputs_embeds = merge_multimodal_embeddings(
-                input_ids, inputs_embeds, multimodal_embeddings,
-                image_token_id)
-
+                input_ids, inputs_embeds, multimodal_embeddings, image_token_id)
         return inputs_embeds
 
     def forward(
@@ -780,66 +696,33 @@ class BagelForConditionalGeneration(nn.Module, SupportsMultiModal, SupportsPP):
         positions: Optional[Tensor] = None,
         intermediate_tensors: Optional[IntermediateTensors] = None,
         inputs_embeds: Optional[Tensor] = None,
-        # Custom parameter to control Bagel's Mixture-of-Talents
         mode: str = "und",
         **kwargs: object,
     ) -> Union[Tensor, IntermediateTensors]:
-        """
-        vLLM's main forward pass.
-        """
         if inputs_embeds is None:
-            raise ValueError(
-                "Bagel's vLLM implementation requires pre-computed `inputs_embeds`."
-            )
+            raise ValueError("Bagel's vLLM implementation requires pre-computed `inputs_embeds`.")
+        
+        hidden_states = self.language_model.model(
+            input_ids, positions, intermediate_tensors, inputs_embeds=inputs_embeds, mode=mode
+        )
 
-        # The `mode` parameter is passed to the underlying Qwen2 model
-        # to select the appropriate 'talent' (e.g., 'und' or 'gen' weights).
-        hidden_states = self.language_model.model(input_ids,
-                                                  positions,
-                                                  intermediate_tensors,
-                                                  inputs_embeds=inputs_embeds,
-                                                  mode=mode)
-
-        # If in generation mode, project the LLM's output back to the
-        # VAE latent space.
         if mode == "gen":
             hidden_states = self.llm2vae(hidden_states)
-
         return hidden_states
 
-    def compute_logits(
-        self,
-        hidden_states: Tensor,
-        sampling_metadata: SamplingMetadata,
-    ) -> Optional[Tensor]:
-        """
-        Computes logits for text generation tasks (e.g., Image2Text).
-        """
+    def compute_logits(self, hidden_states: Tensor, sampling_metadata: SamplingMetadata) -> Optional[Tensor]:
         return self.language_model.lm_head(hidden_states)
 
     def load_weights(self, weights: Iterable[tuple[str, Tensor]]):
-        """
-        Loads weights from multiple safetensor files (`ema.safetensors` and
-        `ae.safetensors`) based on the tensor names.
-        """
-        # Tensors for the VAE model (from ae.safetensors)
         vae_weights: Dict[str, Tensor] = {}
-        # Tensors for the main Bagel model (from ema.safetensors)
         main_model_weights: Dict[str, Tensor] = {}
 
-        # The provided `model.safetensors.index.json` indicates that VAE
-        # weights do not have a prefix like `vae_model.`. The keys start
-        # directly with `encoder.` or `decoder.`.
         for name, tensor in weights:
             if name.startswith("encoder.") or name.startswith("decoder."):
                 vae_weights[name] = tensor
             else:
                 main_model_weights[name] = tensor
 
-        # Load weights for the main model components
         loader = AutoWeightsLoader(self)
-        loader.load_weights(main_model_weights.items(),
-                            mapper=self.hf_to_vllm_mapper)
-
-        # Load weights for the separate VAE model
+        loader.load_weights(main_model_weights.items(), mapper=self.hf_to_vllm_mapper)
         self.vae_model.load_state_dict(vae_weights)
