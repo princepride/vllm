@@ -29,7 +29,7 @@ from vllm import envs
 from vllm.logger import init_logger
 # yapf conflicts with isort for this block
 # yapf: disable
-from vllm.transformers_utils.configs import (ChatGLMConfig, Cohere2Config,
+from vllm.transformers_utils.configs import (BagelConfig, ChatGLMConfig, Cohere2Config,
                                              DbrxConfig, DeepseekVLV2Config,
                                              EAGLEConfig, Exaone4Config,
                                              ExaoneConfig, JAISConfig,
@@ -76,6 +76,7 @@ _CONFIG_REGISTRY_OVERRIDE_HF: dict[str, type[PretrainedConfig]] = {
 }
 
 _CONFIG_REGISTRY: dict[str, type[PretrainedConfig]] = {
+    "bagel": BagelConfig,
     "chatglm": ChatGLMConfig,
     "cohere2": Cohere2Config,
     "dbrx": DbrxConfig,
