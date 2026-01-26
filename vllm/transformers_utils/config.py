@@ -99,6 +99,8 @@ _CONFIG_REGISTRY: dict[str, type[PretrainedConfig]] = LazyConfigDict(
     qwen3_next="Qwen3NextConfig",
     lfm2_moe="Lfm2MoeConfig",
     tarsier2="Tarsier2Config",
+    deepseek_hybrid="DeepseekHybridConfig",
+    custom_deepseek_v3="DeepseekHybridConfig",
 )
 
 _CONFIG_ATTRS_MAPPING: dict[str, str] = {
