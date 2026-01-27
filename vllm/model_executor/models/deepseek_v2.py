@@ -1472,6 +1472,8 @@ class DeepseekV2ForCausalLM(
         intermediate_tensors: IntermediateTensors | None = None,
         inputs_embeds: torch.Tensor | None = None,
     ) -> torch.Tensor | IntermediateTensors:
+        from vllm.model_executor.models.rakuten_extensions import get_inflight_index_map
+        index_map = get_inflight_index_map(positions)
         hidden_states = self.model(
             input_ids, positions, intermediate_tensors, inputs_embeds
         )
